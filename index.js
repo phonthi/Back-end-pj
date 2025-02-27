@@ -4,36 +4,88 @@ const app = express();
 const mysql = require('mysql2');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const hostname = '127.0.0.1';
 const fs = require('fs');
-const port = 3001;
+const path = require("path");
 
-const { readFileSync } = require("fs");
-var path = require("path");
-let cer_part = path.join(process.cwd(), 'isrgrootx1.pem');
+// ใช้ PORT จาก environment variable สำหรับ Vercel
+const PORT = process.env.PORT || 3001;
 
-const connection = mysql.createConnection({
-    host: 'gateway01.ap-southeast-1.prod.aws.tidbcloud.com',
-    user: '2LLA3VcZ2xDv9HN.root',
-    password: "x78GsCrl3tF4FO7M",
-    database: 'nutrition_management',
-    port: 4000,
-    ssl: {
-        ca: fs.readFileSync(cer_part)
-    }
-});
+// สร้างการเชื่อมต่อ MySQL โดยมีการจัดการข้อผิดพลาดที่ดีขึ้น
+let connection;
+try {
+    // ใช้ production environment SSL หรือใช้ไฟล์ตาม path
+    const sslCert = process.env.SSL_CERT || fs.readFileSync(path.join(__dirname, 'isrgrootx1.pem'));
+    
+    connection = mysql.createConnection({
+        host: 'gateway01.ap-southeast-1.prod.aws.tidbcloud.com',
+        user: '2LLA3VcZ2xDv9HN.root',
+        password: "x78GsCrl3tF4FO7M",
+        database: 'nutrition_management',
+        port: 4000,
+        ssl: {
+            ca: sslCert
+        }
+    });
+} catch (err) {
+    console.error('Error setting up MySQL connection:', err.stack);
+}
 
-connection.connect((err) => {
-    if (err) {
-        console.error('Error connecting to MySQL:', err.stack);
+// เชื่อมต่อกับ MySQL และจัดการข้อผิดพลาด
+function connectToDatabase() {
+    if (!connection) {
+        console.error('No database connection available');
         return;
     }
-    console.log('Connected to MySQL as id ' + connection.threadId);
-});
+    
+    connection.connect((err) => {
+        if (err) {
+            console.error('Error connecting to MySQL:', err.stack);
+            // ลองเชื่อมต่อใหม่หลังจาก delay
+            setTimeout(connectToDatabase, 5000);
+            return;
+        }
+        console.log('Connected to MySQL as id ' + connection.threadId);
+    });
+    
+    // จัดการการเชื่อมต่อที่หลุด
+    connection.on('error', (err) => {
+        console.error('Database connection error:', err);
+        if (err.code === 'PROTOCOL_CONNECTION_LOST') {
+            connectToDatabase();
+        } else {
+            throw err;
+        }
+    });
+}
 
+// เริ่มเชื่อมต่อกับฐานข้อมูล
+connectToDatabase();
+
+// แก้ไขการใช้งาน middleware
 app.use(cors());
 app.use(express.json());
 app.use(bodyParser.urlencoded({ extended: false }));
+
+// ฟังก์ชันเพื่อตรวจสอบการเชื่อมต่อ MySQL ก่อนที่จะดำเนินการกับ query
+function safeQuery(sql, params, res, callback) {
+    if (!connection) {
+        return res.status(500).json({ 
+            error: true, 
+            message: "Database connection not available" 
+        });
+    }
+    
+    connection.query(sql, params, (err, results) => {
+        if (err) {
+            console.error('Database error:', err);
+            return res.status(500).json({ 
+                error: true, 
+                message: err.message 
+            });
+        }
+        callback(results);
+    });
+}
 
 // API Documentation
 app.get('/', (req, res) => {
@@ -55,8 +107,8 @@ app.get('/', (req, res) => {
             // Nutrition Data
             { "api_name": "/getNutritionData/", "method": "get", "description": "Get all nutrition data" },
             { "api_name": "/getNutritionDataByUser/:userId", "method": "get", "description": "Get nutrition data by user ID" },
-            { "api_name": "/addNutritionData/", "method": "post", "description": "Add new nutrition data" },
-            { "api_name": "/updateNutritionData/", "method": "put", "description": "Update nutrition data" },
+            { "api_name": "/addNutritionData", "method": "post", "description": "Add new nutrition data" },
+            { "api_name": "/updateNutritionData/:id", "method": "put", "description": "Update nutrition data" },
             { "api_name": "/deleteNutritionData/:id", "method": "delete", "description": "Delete nutrition data" },
             
             // Meal Plans
@@ -93,10 +145,12 @@ app.get('/', (req, res) => {
     });
 });
 
+// แก้ไขการสร้าง server เพื่อรองรับ Vercel
 const server = http.createServer(app);
 
-server.listen(port, 'localhost', () => {
-    console.log(`Server running at http://localhost:${port}/`);
+// แก้ไขการ listen ให้ใช้งานกับ Vercel ได้ (ไม่ระบุ host)
+server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
 });
 
 app.get('/getUserSummary/:userId', (req, res) => {
@@ -118,9 +172,10 @@ app.get('/getUserSummary/:userId', (req, res) => {
     GROUP BY u.user_id, u.username, u.full_name
     `;
     
-    connection.query(sql, [userId], (err, results) => {
-        if (err) return res.status(500).json({ error: true, message: err.message });
-        if (results.length === 0) return res.status(404).json({ error: true, message: "User not found" });
+    safeQuery(sql, [userId], res, (results) => {
+        if (results.length === 0) {
+            return res.status(404).json({ error: true, message: "User not found" });
+        }
         res.json(results[0]);
     });
 });
@@ -130,11 +185,7 @@ app.get('/getUserSummary/:userId', (req, res) => {
 // ==============================
 app.get('/getRoles/', (req, res) => {
     let sql = 'SELECT * FROM roles';
-    connection.query(sql, (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [], res, (results) => {
         res.json(results);
     });
 });
@@ -142,11 +193,7 @@ app.get('/getRoles/', (req, res) => {
 app.get('/getRole/:id', (req, res) => {
     let id = req.params.id;
     let sql = 'SELECT * FROM roles WHERE role_id = ?';
-    connection.query(sql, [id], (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [id], res, (results) => {
         if (results.length === 0) {
             return res.status(404).json({ error: true, message: "Role not found" });
         }
@@ -163,15 +210,7 @@ app.post('/addRole', (req, res) => {
     }
 
     const sql = 'INSERT INTO roles(role_name) VALUES (?)';
-    connection.query(sql, [req.body.role_name], (err, results) => {
-        if (err) {
-            console.error('Error adding role:', err);
-            res.status(500).json({ 
-                error: true, 
-                message: "Error adding role to database" 
-            });
-            return;
-        }
+    safeQuery(sql, [req.body.role_name], res, (results) => {
         res.json({ 
             error: false, 
             data: results, 
@@ -191,12 +230,7 @@ app.put('/updateRole', (req, res) => {
     let sql = 'UPDATE roles SET role_name = ? WHERE role_id = ?';
     let values = [req.body.role_name, req.body.role_id];
     
-    connection.query(sql, values, (err, results) => {
-        if (err) {
-            console.error('Database error:', err);
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, values, res, (results) => {
         if (results.affectedRows === 0) {
             return res.status(404).json({ error: true, message: "Role not found" });
         }
@@ -209,12 +243,7 @@ app.delete('/deleteRole/:id', (req, res) => {
     
     // Check if role is being used by any user
     let checkSql = 'SELECT COUNT(*) as count FROM users WHERE role_id = ?';
-    connection.query(checkSql, [id], (err, checkResults) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
-        
+    safeQuery(checkSql, [id], res, (checkResults) => {
         if (checkResults[0].count > 0) {
             return res.status(400).json({ 
                 error: true, 
@@ -223,11 +252,7 @@ app.delete('/deleteRole/:id', (req, res) => {
         }
         
         let sql = 'DELETE FROM roles WHERE role_id = ?';
-        connection.query(sql, [id], (err, results) => {
-            if (err) {
-                res.status(500).json({ error: true, message: err.message });
-                return;
-            }
+        safeQuery(sql, [id], res, (results) => {
             if (results.affectedRows === 0) {
                 return res.status(404).json({ error: true, message: "Role not found" });
             }
@@ -241,23 +266,15 @@ app.delete('/deleteRole/:id', (req, res) => {
 // ==============================
 app.get('/getUsers/', (req, res) => {
     let sql = 'SELECT * FROM users';
-    connection.query(sql, (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [], res, (results) => {
         res.json(results);
     });
 });
 
-app.get('/getUsers/:id', (req, res) => {
+app.get('/getUser/:id', (req, res) => {
     let id = req.params.id;
     let sql = 'SELECT * FROM users WHERE user_id = ?';
-    connection.query(sql, [id], (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [id], res, (results) => {
         if (results.length === 0) {
             return res.status(404).json({ error: true, message: "User not found" });
         }
@@ -282,15 +299,7 @@ app.post('/addUser', (req, res) => {
         req.body.role_id
     ];
     
-    connection.query(sql, values, (err, results) => {
-        if (err) {
-            console.error('Error adding user:', err);
-            res.status(500).json({ 
-                error: true, 
-                message: "Error adding user to database" 
-            });
-            return;
-        }
+    safeQuery(sql, values, res, (results) => {
         res.json({ 
             error: false, 
             data: results, 
@@ -316,12 +325,7 @@ app.put('/updateUser', (req, res) => {
         req.body.user_id
     ];
     
-    connection.query(sql, values, (err, results) => {
-        if (err) {
-            console.error('Database error:', err);
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, values, res, (results) => {
         if (results.affectedRows === 0) {
             return res.status(404).json({ error: true, message: "User not found" });
         }
@@ -340,12 +344,7 @@ app.put('/updateUserPassword', (req, res) => {
     let sql = 'UPDATE users SET password = SHA2(?, 256) WHERE user_id = ?';
     let values = [req.body.password, req.body.user_id];
     
-    connection.query(sql, values, (err, results) => {
-        if (err) {
-            console.error('Database error:', err);
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, values, res, (results) => {
         if (results.affectedRows === 0) {
             return res.status(404).json({ error: true, message: "User not found" });
         }
@@ -357,6 +356,10 @@ app.delete('/deleteUser/:id', (req, res) => {
     let id = req.params.id;
     
     // Start transaction to delete related records
+    if (!connection) {
+        return res.status(500).json({ error: true, message: "Database connection not available" });
+    }
+    
     connection.beginTransaction(err => {
         if (err) {
             return res.status(500).json({ error: true, message: err.message });
@@ -414,11 +417,7 @@ app.delete('/deleteUser/:id', (req, res) => {
 // ==============================
 app.get('/getNutritionData/', (req, res) => {
     let sql = 'SELECT * FROM nutrition_data';
-    connection.query(sql, (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [], res, (results) => {
         res.json(results);
     });
 });
@@ -426,11 +425,7 @@ app.get('/getNutritionData/', (req, res) => {
 app.get('/getNutritionDataByUser/:userId', (req, res) => {
     let userId = req.params.userId;
     let sql = 'SELECT * FROM nutrition_data WHERE user_id = ? ORDER BY date_logged DESC';
-    connection.query(sql, [userId], (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [userId], res, (results) => {
         res.json(results);
     });
 });
@@ -438,11 +433,7 @@ app.get('/getNutritionDataByUser/:userId', (req, res) => {
 app.get('/getNutritionDataByDate/:userId/:date', (req, res) => {
     let { userId, date } = req.params;
     let sql = 'SELECT * FROM nutrition_data WHERE user_id = ? AND date_logged = ?';
-    connection.query(sql, [userId, date], (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [userId, date], res, (results) => {
         res.json(results);
     });
 });
@@ -465,15 +456,7 @@ app.post('/addNutritionData', (req, res) => {
         req.body.date_logged || new Date().toISOString().split('T')[0]
     ];
     
-    connection.query(sql, values, (err, results) => {
-        if (err) {
-            console.error('Error adding nutrition data:', err);
-            res.status(500).json({ 
-                error: true, 
-                message: "Error adding nutrition data to database" 
-            });
-            return;
-        }
+    safeQuery(sql, values, res, (results) => {
         res.json({ 
             error: false, 
             data: results, 
@@ -494,12 +477,7 @@ app.put('/updateNutritionData/:id', (req, res) => {
         nutritionId
     ];
     
-    connection.query(sql, values, (err, results) => {
-        if (err) {
-            console.error('Database error:', err);
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, values, res, (results) => {
         if (results.affectedRows === 0) {
             return res.status(404).json({ error: true, message: "Nutrition data not found" });
         }
@@ -511,27 +489,20 @@ app.delete('/deleteNutritionData/:id', (req, res) => {
     let id = req.params.id;
     let sql = 'DELETE FROM nutrition_data WHERE nutrition_id = ?';
     
-    connection.query(sql, [id], (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [id], res, (results) => {
         if (results.affectedRows === 0) {
             return res.status(404).json({ error: true, message: "Nutrition data not found" });
         }
         res.json({ error: false, message: "Nutrition data deleted successfully" });
     });
 });
+
 // ==============================
 // BACKUP APIs
 // ==============================
 app.get('/getBackups/', (req, res) => {
     let sql = 'SELECT * FROM backup ORDER BY backup_date DESC';
-    connection.query(sql, (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [], res, (results) => {
         res.json(results);
     });
 });
@@ -539,11 +510,7 @@ app.get('/getBackups/', (req, res) => {
 app.get('/getBackupsByUser/:userId', (req, res) => {
     let userId = req.params.userId;
     let sql = 'SELECT * FROM backup WHERE user_id = ? ORDER BY backup_date DESC';
-    connection.query(sql, [userId], (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [userId], res, (results) => {
         res.json(results);
     });
 });
@@ -551,11 +518,7 @@ app.get('/getBackupsByUser/:userId', (req, res) => {
 app.get('/getBackup/:id', (req, res) => {
     let id = req.params.id;
     let sql = 'SELECT * FROM backup WHERE backup_id = ?';
-    connection.query(sql, [id], (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [id], res, (results) => {
         if (results.length === 0) {
             return res.status(404).json({ error: true, message: "Backup not found" });
         }
@@ -577,15 +540,7 @@ app.post('/addBackup', (req, res) => {
         req.body.backup_file
     ];
     
-    connection.query(sql, values, (err, results) => {
-        if (err) {
-            console.error('Error adding backup:', err);
-            res.status(500).json({ 
-                error: true, 
-                message: "Error adding backup to database" 
-            });
-            return;
-        }
+    safeQuery(sql, values, res, (results) => {
         res.json({ 
             error: false, 
             data: results, 
@@ -598,15 +553,11 @@ app.delete('/deleteBackup/:id', (req, res) => {
     let id = req.params.id;
     let sql = 'DELETE FROM backup WHERE backup_id = ?';
     
-    connection.query(sql, [id], (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [id], res, (results) => {
         if (results.affectedRows === 0) {
-            return res.status(404).json({ error: true, message: "Activity log not found" });
+            return res.status(404).json({ error: true, message: "Backup not found" });
         }
-        res.json({ error: false, message: "Activity log deleted successfully" });
+        res.json({ error: false, message: "Backup deleted successfully" });
     });
 });
 
@@ -615,11 +566,7 @@ app.delete('/deleteBackup/:id', (req, res) => {
 // ==============================
 app.get('/getAlerts/', (req, res) => {
     let sql = 'SELECT * FROM alerts ORDER BY alert_date DESC';
-    connection.query(sql, (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [], res, (results) => {
         res.json(results);
     });
 });
@@ -627,11 +574,7 @@ app.get('/getAlerts/', (req, res) => {
 app.get('/getAlertsByUser/:userId', (req, res) => {
     let userId = req.params.userId;
     let sql = 'SELECT * FROM alerts WHERE user_id = ? ORDER BY alert_date DESC';
-    connection.query(sql, [userId], (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [userId], res, (results) => {
         res.json(results);
     });
 });
@@ -639,11 +582,7 @@ app.get('/getAlertsByUser/:userId', (req, res) => {
 app.get('/getUnreadAlertsByUser/:userId', (req, res) => {
     let userId = req.params.userId;
     let sql = 'SELECT * FROM alerts WHERE user_id = ? AND is_read = 0 ORDER BY alert_date DESC';
-    connection.query(sql, [userId], (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [userId], res, (results) => {
         res.json(results);
     });
 });
@@ -662,15 +601,7 @@ app.post('/addAlert', (req, res) => {
         req.body.alert_message
     ];
     
-    connection.query(sql, values, (err, results) => {
-        if (err) {
-            console.error('Error adding alert:', err);
-            res.status(500).json({ 
-                error: true, 
-                message: "Error adding alert to database" 
-            });
-            return;
-        }
+    safeQuery(sql, values, res, (results) => {
         res.json({ 
             error: false, 
             data: results, 
@@ -683,12 +614,7 @@ app.put('/markAlertAsRead/:id', (req, res) => {
     let id = req.params.id;
     let sql = 'UPDATE alerts SET is_read = 1 WHERE alert_id = ?';
     
-    connection.query(sql, [id], (err, results) => {
-        if (err) {
-            console.error('Database error:', err);
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [id], res, (results) => {
         if (results.affectedRows === 0) {
             return res.status(404).json({ error: true, message: "Alert not found" });
         }
@@ -700,12 +626,7 @@ app.put('/markAllAlertsAsRead/:userId', (req, res) => {
     let userId = req.params.userId;
     let sql = 'UPDATE alerts SET is_read = 1 WHERE user_id = ?';
     
-    connection.query(sql, [userId], (err, results) => {
-        if (err) {
-            console.error('Database error:', err);
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [userId], res, (results) => {
         res.json({ 
             error: false, 
             message: `Marked ${results.affectedRows} alerts as read` 
@@ -717,30 +638,22 @@ app.delete('/deleteAlert/:id', (req, res) => {
     let id = req.params.id;
     let sql = 'DELETE FROM alerts WHERE alert_id = ?';
     
-    connection.query(sql, [id], (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [id], res, (results) => {
         if (results.affectedRows === 0) {
-            return res.status(404).json({ error: true, message: "Nutrition data not found" });
+            return res.status(404).json({ error: true, message: "Alert not found" });
         }
-        res.json({ error: false, message: "Nutrition data deleted successfully" });
+        res.json({ error: false, message: "Alert deleted successfully" });
     });
 });
 
-app.delete('/deleteAllNutritionDataByUser/:userId', (req, res) => {
+app.delete('/deleteAllAlertsByUser/:userId', (req, res) => {
     let userId = req.params.userId;
-    let sql = 'DELETE FROM nutrition_data WHERE user_id = ?';
+    let sql = 'DELETE FROM alerts WHERE user_id = ?';
     
-    connection.query(sql, [userId], (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [userId], res, (results) => {
         res.json({ 
             error: false, 
-            message: `Deleted ${results.affectedRows} nutrition data records for user` 
+            message: `Deleted ${results.affectedRows} alerts for user` 
         });
     });
 });
@@ -750,11 +663,7 @@ app.delete('/deleteAllNutritionDataByUser/:userId', (req, res) => {
 // ==============================
 app.get('/getMealPlans/', (req, res) => {
     let sql = 'SELECT * FROM meal_plans';
-    connection.query(sql, (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [], res, (results) => {
         res.json(results);
     });
 });
@@ -762,11 +671,7 @@ app.get('/getMealPlans/', (req, res) => {
 app.get('/getMealPlansByUser/:userId', (req, res) => {
     let userId = req.params.userId;
     let sql = 'SELECT * FROM meal_plans WHERE user_id = ?';
-    connection.query(sql, [userId], (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [userId], res, (results) => {
         res.json(results);
     });
 });
@@ -774,11 +679,7 @@ app.get('/getMealPlansByUser/:userId', (req, res) => {
 app.get('/getMealPlan/:id', (req, res) => {
     let id = req.params.id;
     let sql = 'SELECT * FROM meal_plans WHERE plan_id = ?';
-    connection.query(sql, [id], (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [id], res, (results) => {
         if (results.length === 0) {
             return res.status(404).json({ error: true, message: "Meal plan not found" });
         }
@@ -802,15 +703,7 @@ app.post('/addMealPlan', (req, res) => {
         req.body.calories
     ];
     
-    connection.query(sql, values, (err, results) => {
-        if (err) {
-            console.error('Error adding meal plan:', err);
-            res.status(500).json({ 
-                error: true, 
-                message: "Error adding meal plan to database" 
-            });
-            return;
-        }
+    safeQuery(sql, values, res, (results) => {
         res.json({ 
             error: false, 
             data: results, 
@@ -835,12 +728,7 @@ app.put('/updateMealPlan', (req, res) => {
         req.body.plan_id
     ];
     
-    connection.query(sql, values, (err, results) => {
-        if (err) {
-            console.error('Database error:', err);
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, values, res, (results) => {
         if (results.affectedRows === 0) {
             return res.status(404).json({ error: true, message: "Meal plan not found" });
         }
@@ -852,11 +740,7 @@ app.delete('/deleteMealPlan/:id', (req, res) => {
     let id = req.params.id;
     let sql = 'DELETE FROM meal_plans WHERE plan_id = ?';
     
-    connection.query(sql, [id], (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
+    safeQuery(sql, [id], res, (results) => {
         if (results.affectedRows === 0) {
             return res.status(404).json({ error: true, message: "Meal plan not found" });
         }
@@ -866,120 +750,4 @@ app.delete('/deleteMealPlan/:id', (req, res) => {
 
 // ==============================
 // ACTIVITY_LOGS APIs
-// ==============================
-app.get('/getActivityLogs/', (req, res) => {
-    let sql = 'SELECT * FROM activity_logs ORDER BY timestamp DESC';
-    connection.query(sql, (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
-        res.json(results);
-    });
-});
-
-app.get('/getActivityLogsByUser/:userId', (req, res) => {
-    let userId = req.params.userId;
-    let sql = 'SELECT * FROM activity_logs WHERE user_id = ? ORDER BY timestamp DESC';
-    connection.query(sql, [userId], (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
-        res.json(results);
-    });
-});
-
-app.get('/getActivityLog/:id', (req, res) => {
-    let id = req.params.id;
-    let sql = 'SELECT * FROM activity_logs WHERE log_id = ?';
-    connection.query(sql, [id], (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
-        if (results.length === 0) {
-            return res.status(404).json({ error: true, message: "Activity log not found" });
-        }
-        res.json(results[0]);
-    });
-});
-
-app.post('/addActivityLog', (req, res) => {
-    if (!req.body.user_id || !req.body.activity || !req.body.duration || !req.body.calories_burned) {
-        return res.status(400).json({ 
-            error: true, 
-            message: "Missing required fields" 
-        });
-    }
-
-    const sql = 'INSERT INTO activity_logs(user_id, activity, duration, calories_burned) VALUES (?, ?, ?, ?)';
-    const values = [
-        req.body.user_id, 
-        req.body.activity, 
-        req.body.duration, 
-        req.body.calories_burned
-    ];
-    
-    connection.query(sql, values, (err, results) => {
-        if (err) {
-            console.error('Error adding activity log:', err);
-            res.status(500).json({ 
-                error: true, 
-                message: "Error adding activity log to database" 
-            });
-            return;
-        }
-        res.json({ 
-            error: false, 
-            data: results, 
-            message: "Activity log added successfully" 
-        });
-    });
-});
-
-app.put('/updateActivityLog', (req, res) => {
-    if (!req.body.log_id) {
-        return res.status(400).json({
-            error: true,
-            message: "Missing log_id"
-        });
-    }
-
-    let sql = 'UPDATE activity_logs SET activity = ?, duration = ?, calories_burned = ? WHERE log_id = ?';
-    let values = [
-        req.body.activity, 
-        req.body.duration, 
-        req.body.calories_burned, 
-        req.body.log_id
-    ];
-    
-    connection.query(sql, values, (err, results) => {
-        if (err) {
-            console.error('Database error:', err);
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
-        if (results.affectedRows === 0) {
-            return res.status(404).json({ error: true, message: "Activity log not found" });
-        }
-        res.json({ error: false, data: results, message: "Activity log updated successfully" });
-    });
-});
-
-app.delete('/deleteActivityLog/:id', (req, res) => {
-    let id = req.params.id;
-    let sql = 'DELETE FROM activity_logs WHERE log_id = ?';
-    
-    connection.query(sql, [id], (err, results) => {
-        if (err) {
-            res.status(500).json({ error: true, message: err.message });
-            return;
-        }
-        if (results.affectedRows === 0) {
-            return res.status(404).json({ error: true, message: "Activity log not found" });
-        }
-        res.json({ error: false, message: "Activity log deleted successfully" });
-    });
-});
-
+//
